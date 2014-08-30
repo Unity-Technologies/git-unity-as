@@ -2,6 +2,7 @@
 
 import psycopg2
 import psycopg2.extras
+import psycopg2.extensions
 import argopen
 import time
 import sys
@@ -9,7 +10,8 @@ import sys
 try:
     conn = psycopg2.connect("dbname='assetservertest' user='admin' host='localhost' password='unity' port='10733'")
 except:
-    print "I am unable to connect to the database"
+    print "Unable to connect to DB"
+    sys.exit()
 
 query_assetversions="""
 SELECT av.created_in AS changeset, guid2hex(a.guid) AS guid, guid2hex(get_asset_guid_safe(av.parent)) AS parent, av.name, av.assettype 
@@ -56,18 +58,34 @@ WHERE stream = lobj AND assetversion = %d
 cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
 def export_data(data):
+    """Helper function to write the data header + given data to stdout"""
+
     print "data %d" % len(data)
     stdout.write(data)
 
 def inline_data(stream, path, code = 'M', mode = '644'):
-    # TODO: Read the stream!
-    data = "StreamData%d" % stream 
+    """Helper function to write the data header + buffer binary data for a given stream to stdout"""
+
+    obj=psycopg2.extensions.lobject(conn, stream,'b')
+    size=obj.seek(0,2)
+    obj.seek(0,0)
     print "%s %s inline \"%s\"" % (code, mode, path)
-    export_data(data + "\n")
+    print "data %d" % size
+    bytes_read=0
+
+    if(len(sys.argv) > 2):
+        stdout.write("[DRYRUN]")
+        return
+
+    while bytes_read < size:
+        buff_size = min(size - bytes_read, 2048)
+        stdout.write(obj.read(buff_size))
+        bytes_read += buff_size
 
 def new_guid_item(name, parent):
-    item = { 'name': name, 'parent': parent }
-    return item
+    """Create and return a object to be stored in the guid_map hash"""
+
+    return { 'name': name, 'parent': parent }
 
 guid_map = {}
 settings_guid="00000000000000000000000000000000"
@@ -76,13 +94,16 @@ trash_guid="ffffffffffffffffffffffffffffffff"
 guid_map[settings_guid]=new_guid_item("ProjectSettings", None)
         
 def guid_path(guid, new_parent = None, name = None):
+    """Get the full path for a given guid object, or move and rename an existing object"""
+
     if(guid_map.has_key(guid) == False):
         if(name is not None):
-            parent = None
-            if(new_parent is not None):
-                parent = new_parent
-            elif(name.endswith(".asset")):
+
+            # Special case for ProjectSettings/*.asset
+            if(name.endswith(".asset") and new_parent is None):
                 parent = settings_guid
+            else:
+                parent = new_parent
 
             guid_map[guid] = new_guid_item(name, parent)
         else:
@@ -106,6 +127,8 @@ def guid_path(guid, new_parent = None, name = None):
     return build_path(guid)
 
 def get_streams(asset_version):
+    """Get a list of large object id's and associated tags for a given asset version"""
+
     cur.execute(query_streams % asset_version);
     streams = cur.fetchall()
     stream_ar = []
@@ -115,6 +138,8 @@ def get_streams(asset_version):
     return stream_ar
 
 def get_ops(asset_name, asset_version, asset_guid, parent_guid):
+    """Get a list of commands to be sent to git fast-import"""
+
     ops=[]
     path=''
     streams = get_streams(asset_version)
@@ -144,7 +169,16 @@ def get_ops(asset_name, asset_version, asset_guid, parent_guid):
 
     return ops 
 
-last_mark = 4001 if len(sys.argv) < 2 else int(sys.argv[1])
+def get_initial_changeset():
+    query="""select serial from changeset order by serial limit 1"""
+    cur.execute(query)
+    return int(cur.fetchone()['serial'])
+
+initial_changeset = get_initial_changeset()
+last_mark=initial_changeset + 1
+if(len(sys.argv) > 1):
+    last_mark = max(last_mark, int(sys.argv[1]))
+
 stdout = argopen.argopen('-', 'wb')
 
 # First build GUID list of assets up until the specified changeset
@@ -157,9 +191,7 @@ cur.execute(query_changesets % last_mark)
 changesets = cur.fetchall()
 for changeset in changesets:
     mark=changeset['id']
-    date = 0
-    if(changeset['date']):
-        date = changeset['date'].strftime('%s')
+    date = changeset['date'].strftime('%s')
 
     author=changeset['author']
     comment=changeset['description']
@@ -170,7 +202,7 @@ for changeset in changesets:
     print "committer %s %s -0700" % (author, date)
     export_data(comment)
 
-    if(last_mark == mark):
+    if(mark == initial_changeset + 1):
         print "deleteall"
     else:
         print "from :%d" % last_mark
@@ -195,8 +227,3 @@ for changeset in changesets:
             options[op_name]()
 
     last_mark=mark
-
-    
-
-
-
