@@ -6,6 +6,7 @@ import psycopg2.extensions
 import argopen
 import time
 import sys
+import getopt
 
 ###### SQL queries
 # query a simple list of asset versions used to build the guid_map
@@ -28,6 +29,7 @@ guid_map = {}
 # Special guids
 settings_guid="00000000000000000000000000000000"
 trash_guid="ffffffffffffffffffffffffffffffff"
+
 ###### End Globals
 
 # Helper function to write the data header + given data to stdout
@@ -208,18 +210,43 @@ def git_export(out, export_mark = 0, opts = { 'no-data': False }):
 
         last_mark=mark
 
+
 #### MAIN
+def main(argv):
 
-try:
-    conn = psycopg2.connect("dbname='assetservertest' user='admin' host='localhost' password='unity' port='10733'")
-    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-except:
-    print "Unable to connect to DB"
-    sys.exit()
+    def help(code):
+        print 'git-unity-as.py [changelist] --no-data'
+        sys.exit(code)
 
+    try:
+        global conn, cur
+        conn = psycopg2.connect("dbname='assetservertest' user='admin' host='localhost' password='unity' port='10733'")
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    except:
+        print "Unable to connect to DB"
+        sys.exit()
 
-# We have to manually initialize the "ProjectSettings" path as it isn't acutally recorded in asset version history
-guid_map[settings_guid]=new_guid_item("ProjectSettings", None)
-stdout = argopen.argopen('-', 'wb')
+    # We have to manually initialize the "ProjectSettings" path as it isn't acutally recorded in asset version history
+    guid_map[settings_guid]=new_guid_item("ProjectSettings", None)
+    export_opts = { 'no-data': False }
 
-git_export(stdout, {'no-data': True})
+    try:
+        opts, args = getopt.getopt(argv,"hn",["no-data"])
+    except getopt.GetoptError:
+       help(2)
+    for opt, arg in opts:
+        if opt == '-h':
+            help(0)
+        elif opt in ("-n", "--no-data"):
+            export_opts['no-data'] = True
+
+    mark = 0
+    if(len(args) > 0):
+        mark = int(args[0])
+
+    stdout = argopen.argopen('-', 'wb')
+    git_export(stdout, mark, export_opts)
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
+
