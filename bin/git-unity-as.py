@@ -7,94 +7,61 @@ import argopen
 import time
 import sys
 
-try:
-    conn = psycopg2.connect("dbname='assetservertest' user='admin' host='localhost' password='unity' port='10733'")
-except:
-    print "Unable to connect to DB"
-    sys.exit()
+###### SQL queries
+# query a simple list of asset versions used to build the guid_map
+query_assetversions="""SELECT av.created_in AS changeset, guid2hex(a.guid) AS guid, guid2hex(get_asset_guid_safe(av.parent)) AS parent, av.name, av.assettype FROM assetversion av, asset a WHERE av.asset=a.serial AND av.created_in < %d ORDER BY av.serial"""
 
-query_assetversions="""
-SELECT av.created_in AS changeset, guid2hex(a.guid) AS guid, guid2hex(get_asset_guid_safe(av.parent)) AS parent, av.name, av.assettype 
-FROM assetversion av, asset a
-WHERE av.asset=a.serial
-AND av.created_in < %d
-ORDER BY av.serial
-"""
-query_assetversiondetails="""
-SELECT vc.changeset, cs.description AS log, extract(epoch FROM commit_time)::int AS date, a.serial, guid2hex(a.guid) AS guid,
-       av.name, guid2hex(get_asset_guid_safe(av.parent)) AS parent, av.assettype, av.serial AS version
-FROM variant v, variantinheritance vi, variantcontents vc, changeset cs, changesetcontents cc, ASsetversion av, ASset a
-WHERE v.name = 'work' 
-AND vi.child = v.serial
-AND vc.variant = vi.parent
-AND cs.serial=vc.changeset
-AND cs.serial=cc.changeset
-AND cc.assetversion=av.serial
-AND av.asset=a.serial
-AND vc.changeset = %d
-ORDER BY vc.changeset
-"""
-query_changesets="""
-SELECT cs.serial as id, cs.description, cs.commit_time as date, 
-  CASE WHEN p.email = 'none' OR p.email IS NULL THEN ' <' || p.username || '@' || p.username || '>'
-       ELSE COALESCE(p.realname, p.username) || ' <' || p.email || '>'
-  END AS author
-FROM   (
-         SELECT person.serial, person.username, users.realname, users.email
-         FROM   person
-         JOIN   all_users__view AS users ON person.username = users.username
-       ) AS p,
-       changeset cs
-WHERE p.serial = cs.creator
-AND cs.serial >= %d
-"""
+# query for full asset version details of a given changeset to translate into git commits
+query_assetversiondetails="""SELECT vc.changeset, cs.description AS log, extract(epoch FROM commit_time)::int AS date, a.serial, guid2hex(a.guid) AS guid, av.name, guid2hex(get_asset_guid_safe(av.parent)) AS parent, av.assettype, av.serial AS version FROM variant v, variantinheritance vi, variantcontents vc, changeset cs, changesetcontents cc, ASsetversion av, ASset a WHERE v.name = 'work' AND vi.child = v.serial AND vc.variant = vi.parent AND cs.serial=vc.changeset AND cs.serial=cc.changeset AND cc.assetversion=av.serial AND av.asset=a.serial AND vc.changeset = %d ORDER BY vc.changeset"""
 
-query_streams="""
-SELECT assetversion,tag,lobj
-FROM stream, assetcontents 
-WHERE stream = lobj AND assetversion = %d
-"""
+# list of changesets, greater than the specified commit
+query_changesets="""SELECT cs.serial as id, cs.description, cs.commit_time as date, CASE WHEN p.email = 'none' OR p.email IS NULL THEN ' <' || p.username || '@' || p.username || '>' ELSE COALESCE(p.realname, p.username) || ' <' || p.email || '>' END AS author FROM (SELECT person.serial, person.username, users.realname, users.email FROM person JOIN all_users__view AS users ON person.username = users.username) AS p, changeset cs WHERE p.serial = cs.creator AND cs.serial >= %d"""
 
-cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+# list of all large object streams associated with a given asset version
+query_streams="""SELECT assetversion,tag,lobj FROM stream, assetcontents WHERE stream = lobj AND assetversion = %d""" 
+###### END SQL queries
 
-def export_data(data):
-    """Helper function to write the data header + given data to stdout"""
+###### Globals
+# Mappings for asset paths
+guid_map = {}
 
-    print "data %d" % len(data)
-    stdout.write(data)
+# Special guids
+settings_guid="00000000000000000000000000000000"
+trash_guid="ffffffffffffffffffffffffffffffff"
+###### End Globals
 
-def inline_data(stream, path, code = 'M', mode = '644'):
-    """Helper function to write the data header + buffer binary data for a given stream to stdout"""
+# Helper function to write the data header + given data to stdout
+def export_data(out, data):
+    out.write("data %d\n" % len(data))
+    out.write(data)
+
+# Helper function to write the data header + buffer binary data for a given stream to stdout
+def inline_data(out, stream, path, code = 'M', mode = '644', nodata = False):
+    out.write("%s %s inline \"%s\"\n" % (code, mode, path))
+
+    if(nodata == True):
+        out.write("data 1\n")
+        out.write("-\n")
+        return
 
     obj=psycopg2.extensions.lobject(conn, stream,'b')
     size=obj.seek(0,2)
     obj.seek(0,0)
-    print "%s %s inline \"%s\"" % (code, mode, path)
-    print "data %d" % size
+    out.write("data %d\n" % size)
     bytes_read=0
-
-    if(len(sys.argv) > 2):
-        stdout.write("[DRYRUN]")
-        return
 
     while bytes_read < size:
         buff_size = min(size - bytes_read, 2048)
-        stdout.write(obj.read(buff_size))
+        out.write(obj.read(buff_size))
         bytes_read += buff_size
 
+# Create and return a object to be stored in the guid_map hash
 def new_guid_item(name, parent):
-    """Create and return a object to be stored in the guid_map hash"""
-
     return { 'name': name, 'parent': parent }
 
-guid_map = {}
-settings_guid="00000000000000000000000000000000"
-trash_guid="ffffffffffffffffffffffffffffffff"
-
-guid_map[settings_guid]=new_guid_item("ProjectSettings", None)
         
+# Get the full path for a given guid object, or move/rename an existing object
 def guid_path(guid, new_parent = None, name = None):
-    """Get the full path for a given guid object, or move and rename an existing object"""
 
     if(guid_map.has_key(guid) == False):
         if(name is not None):
@@ -111,6 +78,7 @@ def guid_path(guid, new_parent = None, name = None):
     elif(new_parent is not None):
         guid_map[guid] = new_guid_item(name, new_parent)
 
+    # recursive function to build a qualified path for a given guid
     def build_path(parent_guid, path = ""):
         node=guid_map[parent_guid]
 
@@ -126,9 +94,8 @@ def guid_path(guid, new_parent = None, name = None):
 
     return build_path(guid)
 
+# Get a list of large object id's and associated tags for a given asset version
 def get_streams(asset_version):
-    """Get a list of large object id's and associated tags for a given asset version"""
-
     cur.execute(query_streams % asset_version);
     streams = cur.fetchall()
     stream_ar = []
@@ -137,9 +104,8 @@ def get_streams(asset_version):
 
     return stream_ar
 
+# Get a list of commands to be sent to git fast-import
 def get_ops(asset_name, asset_version, asset_guid, parent_guid):
-    """Get a list of commands to be sent to git fast-import"""
-
     ops=[]
     path=''
     streams = get_streams(asset_version)
@@ -169,61 +135,91 @@ def get_ops(asset_name, asset_version, asset_guid, parent_guid):
 
     return ops 
 
+# Get a reference to the initial changeset id
 def get_initial_changeset():
     query="""select serial from changeset order by serial limit 1"""
     cur.execute(query)
     return int(cur.fetchone()['serial'])
 
-initial_changeset = get_initial_changeset()
-last_mark=initial_changeset + 1
-if(len(sys.argv) > 1):
-    last_mark = max(last_mark, int(sys.argv[1]))
+def git_export(out, export_mark = 0, opts = { 'no-data': False }):
 
+    if(isinstance(export_mark, dict)):
+        opts = export_mark
+        export_mark = 0
+
+    init_mark = get_initial_changeset()
+    init_branch = False
+
+    # We don't actually want to export the initial changeset, as it is administrative
+    if(export_mark <= init_mark):
+        init_branch = True
+        export_mark = init_mark + 1
+
+    last_mark = export_mark
+
+    # First build GUID list of assets up until the specified changeset
+    cur.execute(query_assetversions % export_mark)
+    versions = cur.fetchall()
+    for version in versions:
+        guid_path(version['guid'], version['parent'], version['name'])
+
+    # Create a commit for each changeset
+    cur.execute(query_changesets % export_mark)
+    changesets = cur.fetchall()
+    for changeset in changesets:
+        mark = changeset['id']
+        date = changeset['date'].strftime('%s')
+
+        author = changeset['author']
+        comment = changeset['description']
+
+        out.write("commit refs/heads/master\n")
+        out.write("mark :%d\n" % mark)
+        out.write("author %s %s -0700\n" % (author, date))
+        out.write("committer %s %s -0700\n" % (author, date))
+        export_data(out, comment)
+
+        # Emit a deletall to reset the branch if we're starting from the beginnning of changeset history
+        if(init_branch):
+            init_branch = False
+            out.write("deleteall\n")
+        else:
+            out.write("from :%d\n" % last_mark)
+
+        # emmit file operations and version data for the current changeset
+        cur.execute(query_assetversiondetails % mark)
+        versions = cur.fetchall()
+
+        for version in versions:
+            ops = get_ops(version['name'], version['version'], version['guid'], version['parent'])
+            for op in ops:
+                op_name=op[0]
+                path=op[1] 
+                stream=op[2]
+
+                def M():
+                    inline_data(out, stream, path, nodata=opts['no-data'])
+
+                def D():
+                    out.write("D %s\n" % path)
+
+                options = { 'M': M, 'D': D }
+                options[op_name]()
+
+        last_mark=mark
+
+#### MAIN
+
+try:
+    conn = psycopg2.connect("dbname='assetservertest' user='admin' host='localhost' password='unity' port='10733'")
+    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+except:
+    print "Unable to connect to DB"
+    sys.exit()
+
+
+# We have to manually initialize the "ProjectSettings" path as it isn't acutally recorded in asset version history
+guid_map[settings_guid]=new_guid_item("ProjectSettings", None)
 stdout = argopen.argopen('-', 'wb')
 
-# First build GUID list of assets up until the specified changeset
-cur.execute(query_assetversions % last_mark)
-versions = cur.fetchall()
-for version in versions:
-    guid_path(version['guid'], version['parent'], version['name'])
-
-cur.execute(query_changesets % last_mark)
-changesets = cur.fetchall()
-for changeset in changesets:
-    mark=changeset['id']
-    date = changeset['date'].strftime('%s')
-
-    author=changeset['author']
-    comment=changeset['description']
-
-    print "commit refs/heads/master"
-    print "mark :%d" % mark
-    print "author %s %s -0700" % (author, date)
-    print "committer %s %s -0700" % (author, date)
-    export_data(comment)
-
-    if(mark == initial_changeset + 1):
-        print "deleteall"
-    else:
-        print "from :%d" % last_mark
-
-    cur.execute(query_assetversiondetails % mark)
-    versions = cur.fetchall()
-
-    for version in versions:
-        ops = get_ops(version['name'], version['version'], version['guid'], version['parent'])
-        for op in ops:
-            op_name=op[0]
-            path=op[1] 
-            stream=op[2]
-
-            def M():
-                inline_data(stream, path)
-
-            def D():
-                print "D %s" % path
-
-            options = { 'M': M, 'D': D }
-            options[op_name]()
-
-    last_mark=mark
+git_export(stdout, {'no-data': True})
