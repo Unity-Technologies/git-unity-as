@@ -3,10 +3,16 @@
 import psycopg2
 import psycopg2.extras
 import psycopg2.extensions
-import argopen
 import time
 import sys
 import getopt
+from os.path import expanduser
+import subprocess
+import sys
+
+if sys.platform == "win32":
+    import os, msvcrt
+    msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
 
 ###### SQL queries
 # query a simple list of asset versions used to build the guid_map
@@ -23,13 +29,17 @@ query_streams="""SELECT assetversion,tag,lobj FROM stream, assetcontents WHERE s
 ###### END SQL queries
 
 ###### Globals
-# Mappings for asset paths
-guid_map = {}
-
 # Special guids
 settings_guid="00000000000000000000000000000000"
 trash_guid="ffffffffffffffffffffffffffffffff"
 
+# Mappings for asset paths
+guid_map = {}
+# We have to manually initialize the "ProjectSettings" path as it isn't acutally recorded in asset version history
+guid_map[settings_guid] = { 'name': "ProjectSettings", 'parent': None }
+
+# Directory where repositories for asset server databases are created
+repo_root="%s/Library/AssetServer/Cloud/Chameleon" % expanduser("~")
 ###### End Globals
 
 # Helper function to write the data header + given data to stdout
@@ -60,7 +70,6 @@ def inline_data(out, stream, path, code = 'M', mode = '644', nodata = False):
 # Create and return a object to be stored in the guid_map hash
 def new_guid_item(name, parent):
     return { 'name': name, 'parent': parent }
-
         
 # Get the full path for a given guid object, or move/rename an existing object
 def guid_path(guid, new_parent = None, name = None):
@@ -211,41 +220,82 @@ def git_export(out, export_mark = 0, opts = { 'no-data': False }):
         last_mark=mark
 
 
-#### MAIN
-def main(argv):
-
-    def help(code):
-        print 'git-unity-as.py [changelist] --no-data'
-        sys.exit(code)
-
+def db_connect(dbname, user, password, host = 'localhost', port = 10733):
+    conn_str = "dbname='%s' user='%s' host='%s' password='%s' port='%d'" % (dbname, user, host, password, port)
     try:
         global conn, cur
-        conn = psycopg2.connect("dbname='assetservertest' user='admin' host='localhost' password='unity' port='10733'")
+        conn = psycopg2.connect(conn_str)
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
     except:
         print "Unable to connect to DB"
         sys.exit()
 
-    # We have to manually initialize the "ProjectSettings" path as it isn't acutally recorded in asset version history
-    guid_map[settings_guid]=new_guid_item("ProjectSettings", None)
-    export_opts = { 'no-data': False }
+def help(code):
+    print 'git-unity-as.py [changelist] --db <name> [--no-data] [--stdout] [--username=<name>]\n'
+    print '                [--password=<password>] [--host=<host>] [--port=<num>]'
+    sys.exit(code)
 
+process = None
+def get_export_pipe(type = 'git'):
+    def git():
+        process = subprocess.Popen(['git', 'fast-import'], stdin=subprocess.PIPE)
+        return process.stdin
+
+    def stdout():
+        return sys.stdout
+
+    options = { 'git': git, 'stdout': stdout }
+    return options[type]()
+
+#### MAIN
+def main(argv):
+
+    export_opts = { 'no-data': False }
+    export_type = 'git'
+    dbname = None
+    user = None
+    password = None
+    host = 'localhost'
+    port = 10733
+    
     try:
-        opts, args = getopt.getopt(argv,"hn",["no-data"])
+        opts, args = getopt.getopt(argv,'h',["no-data","stdout","db=","username=","password=","host=","port="])
     except getopt.GetoptError:
        help(2)
     for opt, arg in opts:
         if opt == '-h':
             help(0)
-        elif opt in ("-n", "--no-data"):
+        elif opt in ("--no-data"):
             export_opts['no-data'] = True
+        elif opt in ("--stdout"):
+            export_type = 'stdout'
+        elif opt in ("--db"):
+            dbname = arg
+        elif opt in ("--username"):
+            user = arg
+        elif opt in ("--password"):
+            password = arg
+        elif opt in ("--host"):
+            host = arg
+        elif opt in ("--port"):
+            port = arg
+
+    if(dbname == None):
+        help(2)
+
+    db_connect(dbname, user, password, host, port)
 
     mark = 0
     if(len(args) > 0):
         mark = int(args[0])
 
-    stdout = argopen.argopen('-', 'wb')
-    git_export(stdout, mark, export_opts)
+    out = get_export_pipe(export_type)
+    git_export(out, mark, export_opts)
+
+    # Allow the git sub process to clean up and exit
+    if(process is not None):
+        process.communicate()
+        process.wait()
 
 if __name__ == "__main__":
     main(sys.argv[1:])
