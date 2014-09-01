@@ -238,7 +238,7 @@ def help(code):
 process = None
 def get_export_pipe(type = 'git'):
     def git():
-        process = subprocess.Popen(['git', 'fast-import'], stdin=subprocess.PIPE)
+        process = subprocess.Popen('git fast-import', stdin=subprocess.PIPE, shell=True)
         return process.stdin
 
     def stdout():
@@ -294,7 +294,6 @@ def main(argv):
 
     # Allow the git sub process to clean up and exit
     if(process is not None):
-        process.communicate()
         process.wait()
 
 if __name__ == "__main__":
