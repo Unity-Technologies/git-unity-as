@@ -5,10 +5,24 @@ import psycopg2.extras
 import psycopg2.extensions
 import time
 import sys
+import os
 import getopt
-from os.path import expanduser
+from os import path
 import subprocess
 import sys
+import json
+
+class cd:
+    """Context manager for changing the current working directory"""
+    def __init__(self, newPath):
+        self.newPath = newPath
+
+    def __enter__(self):
+        self.savedPath = os.getcwd()
+        os.chdir(self.newPath)
+
+    def __exit__(self, etype, value, traceback):
+        os.chdir(self.savedPath)
 
 if sys.platform == "win32":
     import os, msvcrt
@@ -16,13 +30,13 @@ if sys.platform == "win32":
 
 ###### SQL queries
 # query a simple list of asset versions used to build the guid_map
-query_assetversions="""SELECT av.created_in AS changeset, guid2hex(a.guid) AS guid, guid2hex(get_asset_guid_safe(av.parent)) AS parent, av.name, av.assettype FROM assetversion av, asset a WHERE av.asset=a.serial AND av.created_in < %d ORDER BY av.serial"""
+query_assetversions="""SELECT av.created_in AS changeset, guid2hex(a.guid) AS guid, guid2hex(get_asset_guid_safe(av.parent)) AS parent, av.name, av.assettype FROM assetversion av, asset a WHERE av.asset=a.serial AND av.created_in <= %d ORDER BY av.serial"""
 
 # query for full asset version details of a given changeset to translate into git commits
 query_assetversiondetails="""SELECT vc.changeset, cs.description AS log, extract(epoch FROM commit_time)::int AS date, a.serial, guid2hex(a.guid) AS guid, av.name, guid2hex(get_asset_guid_safe(av.parent)) AS parent, av.assettype, av.serial AS version FROM variant v, variantinheritance vi, variantcontents vc, changeset cs, changesetcontents cc, ASsetversion av, ASset a WHERE v.name = 'work' AND vi.child = v.serial AND vc.variant = vi.parent AND cs.serial=vc.changeset AND cs.serial=cc.changeset AND cc.assetversion=av.serial AND av.asset=a.serial AND vc.changeset = %d ORDER BY vc.changeset"""
 
 # list of changesets, greater than the specified commit
-query_changesets="""SELECT cs.serial as id, cs.description, cs.commit_time as date, CASE WHEN p.email = 'none' OR p.email IS NULL THEN ' <' || p.username || '@' || p.username || '>' ELSE COALESCE(p.realname, p.username) || ' <' || p.email || '>' END AS author FROM (SELECT person.serial, person.username, users.realname, users.email FROM person JOIN all_users__view AS users ON person.username = users.username) AS p, changeset cs WHERE p.serial = cs.creator AND cs.serial >= %d"""
+query_changesets="""SELECT cs.serial as id, cs.description, cs.commit_time as date, CASE WHEN p.email = 'none' OR p.email IS NULL THEN ' <' || p.username || '@' || p.username || '>' ELSE COALESCE(p.realname, p.username) || ' <' || p.email || '>' END AS author FROM (SELECT person.serial, person.username, users.realname, users.email FROM person JOIN all_users__view AS users ON person.username = users.username) AS p, changeset cs WHERE p.serial = cs.creator AND cs.serial > %d"""
 
 # list of all large object streams associated with a given asset version
 query_streams="""SELECT assetversion,tag,lobj FROM stream, assetcontents WHERE stream = lobj AND assetversion = %d""" 
@@ -38,8 +52,6 @@ guid_map = {}
 # We have to manually initialize the "ProjectSettings" path as it isn't acutally recorded in asset version history
 guid_map[settings_guid] = { 'name': "ProjectSettings", 'parent': None }
 
-# Directory where repositories for asset server databases are created
-repo_root="%s/Library/AssetServer/Cloud/Chameleon" % expanduser("~")
 ###### End Globals
 
 # Helper function to write the data header + given data to stdout
@@ -152,32 +164,33 @@ def get_initial_changeset():
     cur.execute(query)
     return int(cur.fetchone()['serial'])
 
-def git_export(out, export_mark = 0, opts = { 'no-data': False }):
+def git_export(out, last_mark = 0, opts = { 'no-data': False }):
 
-    if(isinstance(export_mark, dict)):
-        opts = export_mark
-        export_mark = 0
+    if(isinstance(last_mark, dict)):
+        opts = last_mark
+        last_mark = 0
 
     init_mark = get_initial_changeset()
     init_branch = False
 
-    # We don't actually want to export the initial changeset, as it is administrative
-    if(export_mark <= init_mark):
+    if(last_mark <= init_mark):
         init_branch = True
-        export_mark = init_mark + 1
-
-    last_mark = export_mark
+        last_mark = init_mark
 
     # First build GUID list of assets up until the specified changeset
-    cur.execute(query_assetversions % export_mark)
+    cur.execute(query_assetversions % last_mark)
     versions = cur.fetchall()
     for version in versions:
         guid_path(version['guid'], version['parent'], version['name'])
 
     # Create a commit for each changeset
-    cur.execute(query_changesets % export_mark)
+    cur.execute(query_changesets % last_mark)
     changesets = cur.fetchall()
+    sys.stderr.write("Last exported changeset: %d\n" % last_mark)
+    sys.stderr.write("New changesets to export: %d\n" % len(changesets))
+    i = 0
     for changeset in changesets:
+        i = i + 1
         mark = changeset['id']
         date = changeset['date'].strftime('%s')
 
@@ -194,10 +207,12 @@ def git_export(out, export_mark = 0, opts = { 'no-data': False }):
         if(init_branch):
             init_branch = False
             out.write("deleteall\n")
+        elif(i == 1):
+            out.write("from refs/heads/master^0\n")
         else:
             out.write("from :%d\n" % last_mark)
 
-        # emmit file operations and version data for the current changeset
+        # emit file operations and version data for the current changeset
         cur.execute(query_assetversiondetails % mark)
         versions = cur.fetchall()
 
@@ -217,8 +232,15 @@ def git_export(out, export_mark = 0, opts = { 'no-data': False }):
                 options = { 'M': M, 'D': D }
                 options[op_name]()
 
-        last_mark=mark
+        edited_comment = comment.replace('\n', ' ')
+        if(len(edited_comment) > 100):
+            edited_comment = edited_comment[:100] + "..."
 
+        out.write("progress Processed changeset %d, %d file(s): %s\n" % (mark, len(versions), edited_comment))
+        last_mark=mark
+        
+    out.write("progress Done.\n")
+    return last_mark
 
 def db_connect(dbname, user, password, host = 'localhost', port = 10733):
     conn_str = "dbname='%s' user='%s' host='%s' password='%s' port='%d'" % (dbname, user, host, password, port)
@@ -231,14 +253,15 @@ def db_connect(dbname, user, password, host = 'localhost', port = 10733):
         sys.exit()
 
 def help(code):
-    print 'git-unity-as.py [changelist] --db <name> [--no-data] [--stdout] [--username=<name>]\n'
-    print '                [--password=<password>] [--host=<host>] [--port=<num>]'
+    print 'git-unity-as.py --db <name> [--no-data] [--stdout] [--reimport] [--repopath=<path>]'
+    print '                [--username=<name>] [--password=<password>] [--host=<host>] [--port=<num>]'
     sys.exit(code)
 
 process = None
 def get_export_pipe(type = 'git'):
     def git():
-        process = subprocess.Popen('git fast-import', stdin=subprocess.PIPE, shell=True)
+        sed = subprocess.Popen("sed 's/^progress //'", stdin=subprocess.PIPE, shell=True)
+        process = subprocess.Popen('git fast-import --quiet', stdin=subprocess.PIPE, stdout=sed.stdin, shell=True)
         return process.stdin
 
     def stdout():
@@ -246,6 +269,34 @@ def get_export_pipe(type = 'git'):
 
     options = { 'git': git, 'stdout': stdout }
     return options[type]()
+
+def init_repo_root():
+    if(path.exists('.git') == False):
+        subprocess.call('git init', shell=True)
+        subprocess.wait()
+
+    conf = load_config()
+    return conf.get('last_mark', -1)
+        
+def conf_path():
+    return path.normpath(path.join(os.getcwd(), '.git/git-unity-as.conf'))
+
+def load_config():
+    conf = {}
+    if(path.exists(conf_path())):
+        with open(conf_path()) as f:
+            conf = json.loads(f.read())
+
+    return conf
+
+def save_config(obj):
+    conffile = conf_path()
+    conf = load_config()
+    conf = dict(conf.items() + obj.items())
+
+    f = open(conffile, 'w')
+    f.write(json.dumps(conf, sort_keys = True, indent = 2, ensure_ascii=True))
+    f.close()
 
 #### MAIN
 def main(argv):
@@ -257,9 +308,17 @@ def main(argv):
     password = None
     host = 'localhost'
     port = 10733
-    
+    custom_path = False 
+    reimport = False
+
+    # Directory where repositories for asset server databases are created
+    if(sys.platform == "win32"):
+        repo_root=path.expandvars("%ProgramFiles%\Unity\AssetServer\Cloud\Chameleon")
+    else:
+        repo_root=path.expanduser("~/Library/UnityAssetServer/Cloud/Chameleon")
+
     try:
-        opts, args = getopt.getopt(argv,'h',["no-data","stdout","db=","username=","password=","host=","port="])
+        opts, args = getopt.getopt(argv,'h',["no-data","stdout","reimport","db=","username=","password=","host=","port=","repopath="])
     except getopt.GetoptError:
        help(2)
     for opt, arg in opts:
@@ -279,18 +338,35 @@ def main(argv):
             host = arg
         elif opt in ("--port"):
             port = arg
+        elif opt in ("--reimport"):
+            reimport = True
+        elif opt in ("--repopath"):
+            custom_path = True
+            repo_root = path.normpath(arg)
 
     if(dbname == None):
         help(2)
 
     db_connect(dbname, user, password, host, port)
 
-    mark = 0
-    if(len(args) > 0):
-        mark = int(args[0])
+    if(custom_path == False):
+        repo_root = path.join(repo_root, dbname)
 
-    out = get_export_pipe(export_type)
-    git_export(out, mark, export_opts)
+    if(path.exists(repo_root) == False):
+        print "Creating output dir '%s'" % repo_root
+        try:
+            os.makedirs(repo_root)
+        except:
+            print "Could not create output dir '%s'" % repo_root
+            sys.exit(2)
+
+    with cd(repo_root):
+        last_mark = init_repo_root()
+        if(reimport == True): last_mark = 0
+        out = get_export_pipe(export_type)
+        last_mark = git_export(out, last_mark, export_opts)
+        if(export_type == 'git'):
+            save_config({ 'last_mark': last_mark })
 
     # Allow the git sub process to clean up and exit
     if(process is not None):
