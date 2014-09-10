@@ -33,13 +33,25 @@ if sys.platform == "win32":
 query_assetversions="""SELECT av.created_in AS changeset, guid2hex(a.guid) AS guid, guid2hex(get_asset_guid_safe(av.parent)) AS parent, av.name, av.assettype FROM assetversion av, asset a WHERE av.asset=a.serial AND av.created_in <= %d ORDER BY av.serial"""
 
 # query for full asset version details of a given changeset to translate into git commits
-query_assetversiondetails="""SELECT vc.changeset, cs.description AS log, extract(epoch FROM commit_time)::int AS date, a.serial, guid2hex(a.guid) AS guid, av.name, guid2hex(get_asset_guid_safe(av.parent)) AS parent, av.assettype, av.serial AS version FROM variant v, variantinheritance vi, variantcontents vc, changeset cs, changesetcontents cc, ASsetversion av, ASset a WHERE v.name = 'work' AND vi.child = v.serial AND vc.variant = vi.parent AND cs.serial=vc.changeset AND cs.serial=cc.changeset AND cc.assetversion=av.serial AND av.asset=a.serial AND vc.changeset = %d ORDER BY vc.changeset"""
+query_assetversiondetails="""SELECT vc.changeset, cs.description AS log, extract(epoch FROM commit_time)::int AS date, a.serial, guid2hex(a.guid) AS guid, av.name, guid2hex(get_asset_guid_safe(av.parent)) AS parent, av.assettype, av.serial AS version FROM variant v, variantinheritance vi, variantcontents vc, changeset cs, changesetcontents cc, ASsetversion av, ASset a WHERE v.name = 'work' AND vi.child = v.serial AND vc.variant = vi.parent AND cs.serial=vc.changeset AND cs.serial=cc.changeset AND cc.assetversion=av.serial AND av.asset=a.serial AND vc.changeset = %d ORDER BY av.serial"""
+
+# gets a user list with associated email addresses, if any
+query_users="""select person.serial, person.username, split_part(pg_shdescription.description, ':'::text, 1) AS realname, split_part(pg_shdescription.description, ':'::text, 2) AS email FROM person LEFT JOIN pg_user ON person.username = pg_user.usename LEFT JOIN pg_shdescription ON pg_user.usesysid = pg_shdescription.objoid"""
 
 # list of changesets, greater than the specified commit
-query_changesets="""SELECT cs.serial as id, cs.description, cs.commit_time as date, CASE WHEN p.email = 'none' OR p.email IS NULL THEN ' <' || p.username || '@' || p.username || '>' ELSE COALESCE(p.realname, p.username) || ' <' || p.email || '>' END AS author FROM (SELECT person.serial, person.username, users.realname, users.email FROM person JOIN all_users__view AS users ON person.username = users.username) AS p, changeset cs WHERE p.serial = cs.creator AND cs.serial > %d"""
+query_changesets="""SELECT cs.serial as id, cs.description, cs.commit_time as date, CASE WHEN p.email = 'none' OR p.email IS NULL THEN ' <' || p.username || '@' || p.username || '>' ELSE COALESCE(p.realname, p.username) || ' <' || p.email || '>' END AS author FROM (""" + query_users + """) AS p, changeset cs WHERE p.serial = cs.creator AND cs.serial > %d"""
 
 # list of all large object streams associated with a given asset version
 query_streams="""SELECT assetversion,tag,lobj FROM stream, assetcontents WHERE stream = lobj AND assetversion = %d""" 
+
+# function called by trigger for auto update
+query_func_auto_update="""CREATE OR REPLACE FUNCTION git_unity_as ()
+  RETURNS integer AS $$
+import subprocess
+return subprocess.call(['/opt/unity_asset_server/bin/git-unity-as.py','--db=assetservertest','--username=admin','--password=unity'])
+return 0
+$$ LANGUAGE plpythonu;"""
+
 ###### END SQL queries
 
 ###### Globals
@@ -78,6 +90,7 @@ def inline_data(out, stream, path, code = 'M', mode = '644', nodata = False):
         buff_size = min(size - bytes_read, 2048)
         out.write(obj.read(buff_size))
         bytes_read += buff_size
+
 
 # Create and return a object to be stored in the guid_map hash
 def new_guid_item(name, parent):
@@ -238,6 +251,10 @@ def git_export(out, last_mark = 0, opts = { 'no-data': False }):
 
         out.write("progress Processed changeset %d, %d file(s): %s\n" % (mark, len(versions), edited_comment))
         last_mark=mark
+
+        # Track last successful changeset import
+        if(opts['export-type'] == 'git'):
+            save_config({ 'last_mark': last_mark })
         
     out.write("progress Done.\n")
     return last_mark
@@ -272,8 +289,7 @@ def get_export_pipe(type = 'git'):
 
 def init_repo_root():
     if(path.exists('.git') == False):
-        subprocess.call('git init', shell=True)
-        subprocess.wait()
+        subprocess.call(['git','init'])
 
     conf = load_config()
     return conf.get('last_mark', -1)
@@ -301,8 +317,7 @@ def save_config(obj):
 #### MAIN
 def main(argv):
 
-    export_opts = { 'no-data': False }
-    export_type = 'git'
+    export_opts = { 'no-data': False, 'export-type': 'git' }
     dbname = None
     user = None
     password = None
@@ -313,9 +328,10 @@ def main(argv):
 
     # Directory where repositories for asset server databases are created
     if(sys.platform == "win32"):
+        # TODO: verify and test this
         repo_root=path.expandvars("%ProgramFiles%\Unity\AssetServer\Cloud\Chameleon")
     else:
-        repo_root=path.expanduser("~/Library/UnityAssetServer/Cloud/Chameleon")
+        repo_root=path.expanduser("~/data/UnityCloud/Chameleon")
 
     try:
         opts, args = getopt.getopt(argv,'h',["no-data","stdout","reimport","db=","username=","password=","host=","port=","repopath="])
@@ -327,7 +343,7 @@ def main(argv):
         elif opt in ("--no-data"):
             export_opts['no-data'] = True
         elif opt in ("--stdout"):
-            export_type = 'stdout'
+            export_opts['export-type'] = 'stdout'
         elif opt in ("--db"):
             dbname = arg
         elif opt in ("--username"):
@@ -363,10 +379,8 @@ def main(argv):
     with cd(repo_root):
         last_mark = init_repo_root()
         if(reimport == True): last_mark = 0
-        out = get_export_pipe(export_type)
+        out = get_export_pipe(export_opts['export-type'])
         last_mark = git_export(out, last_mark, export_opts)
-        if(export_type == 'git'):
-            save_config({ 'last_mark': last_mark })
 
     # Allow the git sub process to clean up and exit
     if(process is not None):
