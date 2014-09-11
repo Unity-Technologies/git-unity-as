@@ -33,7 +33,7 @@ if sys.platform == "win32":
 query_assetversions="""SELECT av.created_in AS changeset, guid2hex(a.guid) AS guid, guid2hex(get_asset_guid_safe(av.parent)) AS parent, av.name, av.assettype FROM assetversion av, asset a WHERE av.asset=a.serial AND av.created_in <= %d ORDER BY av.serial"""
 
 # query for full asset version details of a given changeset to translate into git commits
-query_assetversiondetails="""SELECT vc.changeset, cs.description AS log, extract(epoch FROM commit_time)::int AS date, a.serial, guid2hex(a.guid) AS guid, av.name, guid2hex(get_asset_guid_safe(av.parent)) AS parent, av.assettype, av.serial AS version FROM variant v, variantinheritance vi, variantcontents vc, changeset cs, changesetcontents cc, ASsetversion av, ASset a WHERE v.name = 'work' AND vi.child = v.serial AND vc.variant = vi.parent AND cs.serial=vc.changeset AND cs.serial=cc.changeset AND cc.assetversion=av.serial AND av.asset=a.serial AND vc.changeset = %d ORDER BY av.serial"""
+query_assetversiondetails="""SELECT vc.changeset, cs.description AS log, extract(epoch FROM commit_time)::int AS date, a.serial, guid2hex(a.guid) AS guid, av.name, guid2hex(get_asset_guid_safe(av.parent)) AS parent, at.description as assettype, av.serial AS version FROM variant v, variantinheritance vi, variantcontents vc, changeset cs, changesetcontents cc, assetversion av, asset a, assettype at WHERE v.name = 'work' AND vi.child = v.serial AND vc.variant = vi.parent AND cs.serial=vc.changeset AND cs.serial=cc.changeset AND cc.assetversion=av.serial AND av.asset=a.serial AND av.assettype=at.serial AND vc.changeset = %d ORDER BY av.serial"""
 
 # gets a user list with associated email addresses, if any
 query_users="""select person.serial, person.username, split_part(pg_shdescription.description, ':'::text, 1) AS realname, split_part(pg_shdescription.description, ':'::text, 2) AS email FROM person LEFT JOIN pg_user ON person.username = pg_user.usename LEFT JOIN pg_shdescription ON pg_user.usesysid = pg_shdescription.objoid"""
@@ -42,7 +42,7 @@ query_users="""select person.serial, person.username, split_part(pg_shdescriptio
 query_changesets="""SELECT cs.serial as id, cs.description, cs.commit_time as date, CASE WHEN p.email = 'none' OR p.email IS NULL THEN ' <' || p.username || '@' || p.username || '>' ELSE COALESCE(p.realname, p.username) || ' <' || p.email || '>' END AS author FROM (""" + query_users + """) AS p, changeset cs WHERE p.serial = cs.creator AND cs.serial > %d"""
 
 # list of all large object streams associated with a given asset version
-query_streams="""SELECT assetversion,tag,lobj FROM stream, assetcontents WHERE stream = lobj AND assetversion = %d""" 
+query_streams="""SELECT assetversion,tag,lobj FROM stream, assetcontents WHERE stream = lobj AND tag <> 'assetRsrc' AND assetversion = %d""" 
 
 # function called by trigger for auto update
 query_func_auto_update="""CREATE OR REPLACE FUNCTION git_unity_as ()
@@ -72,19 +72,23 @@ def export_data(out, data):
     out.write(data)
 
 # Helper function to write the data header + buffer binary data for a given stream to stdout
-def inline_data(out, stream, path, code = 'M', mode = '644', nodata = False):
+def inline_data(out, stream, path, code = 'M', mode = '644', nodata = False, data = None):
     out.write("%s %s inline \"%s\"\n" % (code, mode, path))
 
-    if(nodata == True):
-        out.write("data 1\n")
-        out.write("-\n")
+    # data provided, do not lookup stream
+    if data != None:
+        export_data(out, data)
         return
 
-    obj=psycopg2.extensions.lobject(conn, stream,'b')
+    obj=psycopg2.extensions.lobject(conn, stream, 'b')
     size=obj.seek(0,2)
     obj.seek(0,0)
     out.write("data %d\n" % size)
     bytes_read=0
+
+    if(nodata == True):
+        out.write("stream %d\n" % stream)
+        return
 
     while bytes_read < size:
         buff_size = min(size - bytes_read, 2048)
@@ -97,22 +101,17 @@ def new_guid_item(name, parent):
     return { 'name': name, 'parent': parent }
         
 # Get the full path for a given guid object, or move/rename an existing object
-def guid_path(guid, new_parent = None, name = None):
-
-    if(guid_map.has_key(guid) == False):
-        if(name is not None):
-
-            # Special case for ProjectSettings/*.asset
-            if(name.endswith(".asset") and new_parent is None):
-                parent = settings_guid
-            else:
-                parent = new_parent
-
-            guid_map[guid] = new_guid_item(name, parent)
-        else:
-            return "";
-    elif(new_parent is not None):
-        guid_map[guid] = new_guid_item(name, new_parent)
+def guid_path(guid, new_parent = None, new_name = None):
+    if guid_map.has_key(guid):
+        if new_parent != None:
+            guid_map[guid]['parent'] = new_parent
+        if new_name != None:
+            guid_map[guid]['name'] = new_name
+    else:
+        # Special case for ProjectSettings/*.asset
+        if(new_name.endswith(".asset") and new_parent is None):
+            new_parent = settings_guid
+        guid_map[guid] = new_guid_item(new_name, new_parent)
 
     # recursive function to build a qualified path for a given guid
     def build_path(parent_guid, path = ""):
@@ -131,20 +130,24 @@ def guid_path(guid, new_parent = None, name = None):
     return build_path(guid)
 
 # Get a list of large object id's and associated tags for a given asset version
-def get_streams(asset_version):
-    cur.execute(query_streams % asset_version);
-    streams = cur.fetchall()
+def get_streams(asset_type, asset_guid, asset_version):
     stream_ar = []
-    for stream in streams:
-        stream_ar.append({ 'tag': stream['tag'], 'lobj': stream['lobj'] })
+    if asset_type == 'dir':
+        meta="""fileFormatVersion: 2\nguid: %s\nfolderAsset: yes\nDefaultImporter:\n  userData: \n""" % asset_guid
+        stream_ar.append({ 'type': asset_type, 'tag': 'asset.meta', 'data': meta })
+    else:
+        cur.execute(query_streams % asset_version);
+        streams = cur.fetchall()
+        for stream in streams:
+            stream_ar.append({ 'type': asset_type, 'tag': stream['tag'], 'lobj': stream['lobj'] })
 
     return stream_ar
 
 # Get a list of commands to be sent to git fast-import
-def get_ops(asset_name, asset_version, asset_guid, parent_guid):
+def get_ops(asset_type, asset_name, asset_version, asset_guid, parent_guid):
     ops=[]
     path=''
-    streams = get_streams(asset_version)
+    streams = get_streams(asset_type, asset_guid, asset_version)
 
     def create_op(op_name, op_path, stream_tag, stream_id):
         if(stream_tag == "asset.meta"):
@@ -157,7 +160,7 @@ def get_ops(asset_name, asset_version, asset_guid, parent_guid):
         if(guid_item['parent'] != parent_guid or guid_item['name'] != asset_name):
             if(guid_item['parent'] != trash_guid):
                 for stream in streams:
-                    ops.append(create_op('D', old_path, stream['tag'], stream['lobj']))
+                    ops.append(create_op('D', old_path, stream['tag'], ''))
 
             path=guid_path(asset_guid, parent_guid, asset_name) 
         else:
@@ -167,7 +170,10 @@ def get_ops(asset_name, asset_version, asset_guid, parent_guid):
 
     if(parent_guid != trash_guid):
         for stream in streams:
-            ops.append(create_op('M', path, stream['tag'], stream['lobj']))
+            if stream['type'] == 'dir':
+                ops.append(create_op('dir', path, stream['tag'], stream['data']))
+            else:
+                ops.append(create_op('M', path, stream['tag'], stream['lobj']))
 
     return ops 
 
@@ -176,6 +182,24 @@ def get_initial_changeset():
     query="""select serial from changeset order by serial limit 1"""
     cur.execute(query)
     return int(cur.fetchone()['serial'])
+
+def sort_versions(versions):
+    lastidx = len(versions) - 1;
+
+    # Move folders to delete below any of their children
+    for x in range(0, lastidx):
+        parent = versions[x]
+        if parent['parent'] != trash_guid:
+            continue
+        
+        for y in range(lastidx, x, -1):
+            child_guid = versions[y]['guid']
+            if guid_map.has_key(child_guid) and guid_map[child_guid]['parent'] == parent['guid']:
+                del versions[x]
+                versions.insert(y, parent)
+                break
+    
+    return versions
 
 def git_export(out, last_mark = 0, opts = { 'no-data': False }):
 
@@ -227,23 +251,28 @@ def git_export(out, last_mark = 0, opts = { 'no-data': False }):
 
         # emit file operations and version data for the current changeset
         cur.execute(query_assetversiondetails % mark)
-        versions = cur.fetchall()
+        versions = sort_versions(cur.fetchall())
+        ops = []
 
         for version in versions:
-            ops = get_ops(version['name'], version['version'], version['guid'], version['parent'])
-            for op in ops:
-                op_name=op[0]
-                path=op[1] 
-                stream=op[2]
+                ops = get_ops(version['assettype'], version['name'], version['version'], version['guid'], version['parent'])
 
-                def M():
-                    inline_data(out, stream, path, nodata=opts['no-data'])
+                for op in ops:
+                    op_name=op[0]
+                    path=op[1] 
+                    stream=op[2]
 
-                def D():
-                    out.write("D %s\n" % path)
+                    def Dir():
+                        inline_data(out, -1, path, data=stream)
 
-                options = { 'M': M, 'D': D }
-                options[op_name]()
+                    def M():
+                        inline_data(out, stream, path, nodata=opts['no-data'])
+
+                    def D():
+                        out.write("D %s\n" % path)
+
+                    options = { 'M': M, 'D': D, 'dir': Dir }
+                    options[op_name]()
 
         edited_comment = comment.replace('\n', ' ')
         if(len(edited_comment) > 100):
