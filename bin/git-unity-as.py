@@ -42,7 +42,7 @@ query_users="""select person.serial, person.username, split_part(pg_shdescriptio
 query_changesets="""SELECT cs.serial as id, cs.description, cs.commit_time as date, CASE WHEN p.email = 'none' OR p.email IS NULL THEN ' <' || p.username || '@' || p.username || '>' ELSE COALESCE(p.realname, p.username) || ' <' || p.email || '>' END AS author FROM (""" + query_users + """) AS p, changeset cs WHERE p.serial = cs.creator AND cs.serial > %d"""
 
 # list of all large object streams associated with a given asset version
-query_streams="""SELECT assetversion,tag,lobj FROM stream, assetcontents WHERE stream = lobj AND tag <> 'assetRsrc' AND assetversion = %d""" 
+query_streams="""SELECT assetversion,tag,lobj FROM stream, assetcontents WHERE stream = lobj AND tag = ANY(ARRAY['asset'::name, 'asset.meta'::name]) AND assetversion = %d""" 
 
 # function called by trigger for auto update
 query_func_auto_update="""CREATE OR REPLACE FUNCTION git_unity_as ()
