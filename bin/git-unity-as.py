@@ -109,7 +109,7 @@ def guid_path(guid, new_parent = None, new_name = None):
             guid_map[guid]['name'] = new_name
     else:
         # Special case for ProjectSettings/*.asset
-        if(new_name.endswith(".asset") and new_parent is None):
+        if(new_name != None and new_name.endswith(".asset") and new_parent is None):
             new_parent = settings_guid
         guid_map[guid] = new_guid_item(new_name, new_parent)
 
@@ -159,6 +159,9 @@ def get_ops(asset_type, asset_name, asset_version, asset_guid, parent_guid):
         old_path=guid_path(asset_guid)
         if(guid_item['parent'] != parent_guid or guid_item['name'] != asset_name):
             if(guid_item['parent'] != trash_guid):
+                if '(DEL_' in old_path:
+                    raise StandardError("Tried to delete a file already in Trash: parent_guid:%s asset_guid:%s path:%s" % (guid_item['parent'], asset_guid, old_path))
+
                 for stream in streams:
                     ops.append(create_op('D', old_path, stream['tag'], ''))
 
@@ -184,20 +187,25 @@ def get_initial_changeset():
     return int(cur.fetchone()['serial'])
 
 def sort_versions(versions):
-    lastidx = len(versions) - 1;
+    cnt = len(versions);
 
     # Move folders to delete below any of their children
-    for x in range(0, lastidx):
+    x = 0 
+    while x < cnt:
         parent = versions[x]
         if parent['parent'] != trash_guid:
+            x = x + 1
             continue
         
-        for y in range(lastidx, x, -1):
+        for y in range(cnt - 1, x, -1):
             child_guid = versions[y]['guid']
             if guid_map.has_key(child_guid) and guid_map[child_guid]['parent'] == parent['guid']:
                 del versions[x]
                 versions.insert(y, parent)
+                x = x - 1
                 break
+
+        x = x + 1
     
     return versions
 
