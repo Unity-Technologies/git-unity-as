@@ -146,37 +146,53 @@ def get_streams(asset_type, asset_guid, asset_version):
 # Get a list of commands to be sent to git fast-import
 def get_ops(asset_type, asset_name, asset_version, asset_guid, parent_guid):
     ops=[]
-    path=''
+    new_path=''
+    rename=False
     streams = get_streams(asset_type, asset_guid, asset_version)
 
     def create_op(op_name, op_path, stream_tag, stream_id):
         if(stream_tag == "asset.meta"):
             op_path += ".meta"
+            if op_name == 'R':
+                stream_id += ".meta"
         return [op_name, op_path, stream_id]
     
     if(guid_map.has_key(asset_guid)):
         guid_item=guid_map[asset_guid]
         old_path=guid_path(asset_guid)
-        if(guid_item['parent'] != parent_guid or guid_item['name'] != asset_name):
-            if(guid_item['parent'] != trash_guid):
+        old_parent_guid=guid_item['parent']
+        old_name = guid_item['name']
+        if(old_parent_guid != settings_guid and (old_parent_guid != parent_guid or old_name != asset_name)):
+            new_path=guid_path(asset_guid, parent_guid, asset_name) 
+            if(old_parent_guid != trash_guid):
+
                 if '(DEL_' in old_path:
-                    raise StandardError("Tried to delete a file already in Trash: parent_guid:%s asset_guid:%s path:%s" % (guid_item['parent'], asset_guid, old_path))
+                    raise StandardError("Tried to rename or delete a file in Trash: parent_guid:%s asset_guid:%s path:%s" % (guid_item['parent'], asset_guid, old_path))
 
                 for stream in streams:
-                    ops.append(create_op('D', old_path, stream['tag'], ''))
+                    if parent_guid == trash_guid:
 
-            path=guid_path(asset_guid, parent_guid, asset_name) 
+                        ops.append(create_op('D', old_path, stream['tag'], ''))
+                    else:
+                        rename = True
+
+                        # When renaming a directory, include a rename command for the base directory as well as the meta file
+                        if(asset_type == 'dir'):
+                            ops.append(create_op('R', old_path, 'asset', new_path))
+                        ops.append(create_op('R', old_path, stream['tag'], new_path))
+
         else:
-            path=old_path
+            new_path=old_path
     else:
-        path=guid_path(asset_guid, parent_guid, asset_name) 
+        new_path=guid_path(asset_guid, parent_guid, asset_name) 
 
     if(parent_guid != trash_guid):
         for stream in streams:
             if stream['type'] == 'dir':
-                ops.append(create_op('dir', path, stream['tag'], stream['data']))
+                if rename == False:
+                    ops.append(create_op('dir', new_path, stream['tag'], stream['data']))
             else:
-                ops.append(create_op('M', path, stream['tag'], stream['lobj']))
+                ops.append(create_op('M', new_path, stream['tag'], stream['lobj']))
 
     return ops 
 
@@ -277,9 +293,12 @@ def git_export(out, last_mark = 0, opts = { 'no-data': False }):
                         inline_data(out, stream, path, nodata=opts['no-data'])
 
                     def D():
-                        out.write("D %s\n" % path)
+                        out.write("D \"%s\"\n" % path)
 
-                    options = { 'M': M, 'D': D, 'dir': Dir }
+                    def R():
+                        out.write("R \"%s\" \"%s\"\n" % (op[1], op[2]))
+
+                    options = { 'M': M, 'D': D, 'R': R, 'dir': Dir }
                     options[op_name]()
 
         edited_comment = comment.replace('\n', ' ')
