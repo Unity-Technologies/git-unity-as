@@ -211,7 +211,7 @@ def git_export(out, args):
     if(last_mark <= init_mark):
         init_branch = True
         last_mark = init_mark
-
+    
     # First build GUID list of assets up until the specified changeset
     cur.execute(query_assetversions % last_mark)
     versions = cur.fetchall()
@@ -232,7 +232,7 @@ def git_export(out, args):
         author = changeset['author']
         comment = changeset['description']
 
-        out.write("commit refs/heads/master\n")
+        out.write("commit refs/heads/%s\n" % args.branch)
         out.write("mark :%d\n" % mark)
         out.write("author %s %s -0700\n" % (author, date))
         out.write("committer %s %s -0700\n" % (author, date))
@@ -330,6 +330,7 @@ def main():
     parser.add_argument('--port', type=int, default=10733)
     parser.add_argument('--init', action='store_true', help='Resets and exports from the initial changeset.')
     parser.add_argument('--no-data', dest='nodata', action='store_true', help='Do not output asset version data (for debugging).')
+    parser.add_argument('--branch', '-b', default='master', help='Target export to specified branch. Default is \'master\'')
     args = parser.parse_args()
 
     # Establish database connection
