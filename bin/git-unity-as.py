@@ -6,27 +6,12 @@ import psycopg2.extensions
 import time
 import sys
 import os
-import getopt
 from os import path
 import subprocess
-import sys
 import json
-
-class cd:
-    """Context manager for changing the current working directory"""
-    def __init__(self, newPath):
-        self.newPath = newPath
-
-    def __enter__(self):
-        self.savedPath = os.getcwd()
-        os.chdir(self.newPath)
-
-    def __exit__(self, etype, value, traceback):
-        os.chdir(self.savedPath)
-
-if sys.platform == "win32":
-    import os, msvcrt
-    msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
+import argparse
+import traceback
+import ConfigParser
 
 ###### SQL queries
 # query a simple list of asset versions used to build the guid_map
@@ -43,14 +28,6 @@ query_changesets="""SELECT cs.serial as id, cs.description, cs.commit_time as da
 
 # list of all large object streams associated with a given asset version
 query_streams="""SELECT assetversion,tag,lobj FROM stream, assetcontents WHERE stream = lobj AND tag = ANY(ARRAY['asset'::name, 'asset.meta'::name]) AND assetversion = %d""" 
-
-# function called by trigger for auto update
-query_func_auto_update="""CREATE OR REPLACE FUNCTION git_unity_as ()
-  RETURNS integer AS $$
-import subprocess
-return subprocess.call(['/opt/unity_asset_server/bin/git-unity-as.py','--db=assetservertest','--username=admin','--password=unity'])
-return 0
-$$ LANGUAGE plpythonu;"""
 
 ###### END SQL queries
 
@@ -136,7 +113,7 @@ def get_streams(asset_type, asset_guid, asset_version):
         meta="""fileFormatVersion: 2\nguid: %s\nfolderAsset: yes\nDefaultImporter:\n  userData: \n""" % asset_guid
         stream_ar.append({ 'type': asset_type, 'tag': 'asset.meta', 'data': meta })
     else:
-        cur.execute(query_streams % asset_version);
+        cur.execute(query_streams % asset_version)
         streams = cur.fetchall()
         for stream in streams:
             stream_ar.append({ 'type': asset_type, 'tag': stream['tag'], 'lobj': stream['lobj'] })
@@ -171,7 +148,6 @@ def get_ops(asset_type, asset_name, asset_version, asset_guid, parent_guid):
 
                 for stream in streams:
                     if parent_guid == trash_guid:
-
                         ops.append(create_op('D', old_path, stream['tag'], ''))
                     else:
                         rename = True
@@ -202,34 +178,32 @@ def get_initial_changeset():
     cur.execute(query)
     return int(cur.fetchone()['serial'])
 
-def sort_versions(versions):
-    cnt = len(versions);
 
-    # Move folders to delete below any of their children
+# Moves folders to delete below any of their children
+def sort_versions(versions):
+    cnt = len(versions)
     x = 0 
     while x < cnt:
         parent = versions[x]
-        if parent['parent'] != trash_guid:
-            x = x + 1
-            continue
-        
-        for y in range(cnt - 1, x, -1):
-            child_guid = versions[y]['guid']
-            if guid_map.has_key(child_guid) and guid_map[child_guid]['parent'] == parent['guid']:
-                del versions[x]
-                versions.insert(y, parent)
-                x = x - 1
-                break
+        if parent['parent'] == trash_guid:
+            for y in range(cnt - 1, x, -1):
+                child_guid = versions[y]['guid']
+                if guid_map.has_key(child_guid) and guid_map[child_guid]['parent'] == parent['guid']:
+                    del versions[x]
+                    versions.insert(y, parent)
+                    x = x - 1
+                    break
 
         x = x + 1
     
     return versions
 
-def git_export(out, last_mark = 0, opts = { 'no-data': False }):
-
-    if(isinstance(last_mark, dict)):
-        opts = last_mark
-        last_mark = 0
+def git_export(out, args):
+    last_mark = 0
+    if not args.init:
+        conf = get_config()
+        if conf.has_option(args.db, 'last_mark'):
+            last_mark = conf.getint(args.db, 'last_mark')
 
     init_mark = get_initial_changeset()
     init_branch = False
@@ -290,7 +264,7 @@ def git_export(out, last_mark = 0, opts = { 'no-data': False }):
                         inline_data(out, -1, path, data=stream)
 
                     def M():
-                        inline_data(out, stream, path, nodata=opts['no-data'])
+                        inline_data(out, stream, path, nodata=args.nodata)
 
                     def D():
                         out.write("D \"%s\"\n" % path)
@@ -309,8 +283,7 @@ def git_export(out, last_mark = 0, opts = { 'no-data': False }):
         last_mark=mark
 
         # Track last successful changeset import
-        if(opts['export-type'] == 'git'):
-            save_config({ 'last_mark': last_mark })
+        get_config().set(args.db, 'last_mark', str(last_mark))
         
     out.write("progress Done.\n")
     return last_mark
@@ -325,123 +298,52 @@ def db_connect(dbname, user, password, host = 'localhost', port = 10733):
         print "Unable to connect to DB"
         sys.exit()
 
-def help(code):
-    print 'git-unity-as.py --db <name> [--no-data] [--stdout] [--reimport] [--repopath=<path>]'
-    print '                [--username=<name>] [--password=<password>] [--host=<host>] [--port=<num>]'
-    sys.exit(code)
+_config=None
+_conf_file=path.join(path.expanduser("~"), ".git-unity-as")
+def config_init(db_name=None):
+    global _config, _conf_file
+    if db_name != None:
+        _config=ConfigParser.SafeConfigParser() 
+        _config.read(_conf_file)
+        if not _config.has_section(db_name):
+            _config.add_section(db_name)
+    return _config
 
-process = None
-def get_export_pipe(type = 'git'):
-    def git():
-        sed = subprocess.Popen("sed 's/^progress //'", stdin=subprocess.PIPE, shell=True)
-        process = subprocess.Popen('git fast-import --quiet', stdin=subprocess.PIPE, stdout=sed.stdin, shell=True)
-        return process.stdin
+def get_config():
+    return _config
 
-    def stdout():
-        return sys.stdout
-
-    options = { 'git': git, 'stdout': stdout }
-    return options[type]()
-
-def init_repo_root():
-    if(path.exists('.git') == False):
-        subprocess.call(['git','init'])
-
-    conf = load_config()
-    return conf.get('last_mark', -1)
-        
-def conf_path():
-    return path.normpath(path.join(os.getcwd(), '.git/git-unity-as.conf'))
-
-def load_config():
-    conf = {}
-    if(path.exists(conf_path())):
-        with open(conf_path()) as f:
-            conf = json.loads(f.read())
-
-    return conf
-
-def save_config(obj):
-    conffile = conf_path()
-    conf = load_config()
-    conf = dict(conf.items() + obj.items())
-
-    f = open(conffile, 'w')
-    f.write(json.dumps(conf, sort_keys = True, indent = 2, ensure_ascii=True))
-    f.close()
+def save_config():
+    if _config != None:
+        with open(_conf_file, 'wb') as configfile:
+            _config.write(configfile)
 
 #### MAIN
-def main(argv):
+def main():
+    desc="""Exports a Unity Asset Server database to a git fast-import stream. Typically you would pipe the output to
+    git from a valid git repository, like so: %s | git fast-import""" % path.basename(__file__)
 
-    export_opts = { 'no-data': False, 'export-type': 'git' }
-    dbname = None
-    user = None
-    password = None
-    host = 'localhost'
-    port = 10733
-    custom_path = False 
-    reimport = False
+    parser = argparse.ArgumentParser(description=desc)
+    parser.add_argument('db', help='Asset Server database name.')
+    parser.add_argument('--username', required=True, help='Database user with read access to specified database.')
+    parser.add_argument('--password', help='Password for specified database user.')
+    parser.add_argument('--host', default='localhost')
+    parser.add_argument('--port', type=int, default=10733)
+    parser.add_argument('--init', action='store_true', help='Resets and exports from the initial changeset.')
+    parser.add_argument('--no-data', dest='nodata', action='store_true', help='Do not output asset version data (for debugging).')
+    args = parser.parse_args()
 
-    # Directory where repositories for asset server databases are created
-    if(sys.platform == "win32"):
-        # TODO: verify and test this
-        repo_root=path.expandvars("%ProgramFiles%\Unity\AssetServer\Cloud\Chameleon")
-    else:
-        repo_root=path.expanduser("~/data/UnityCloud/Chameleon")
+    # Establish database connection
+    db_connect(args.db, args.username, args.password, args.host, args.port)
+    config_init(args.db)
 
     try:
-        opts, args = getopt.getopt(argv,'h',["no-data","stdout","reimport","db=","username=","password=","host=","port=","repopath="])
-    except getopt.GetoptError:
-       help(2)
-    for opt, arg in opts:
-        if opt == '-h':
-            help(0)
-        elif opt in ("--no-data"):
-            export_opts['no-data'] = True
-        elif opt in ("--stdout"):
-            export_opts['export-type'] = 'stdout'
-        elif opt in ("--db"):
-            dbname = arg
-        elif opt in ("--username"):
-            user = arg
-        elif opt in ("--password"):
-            password = arg
-        elif opt in ("--host"):
-            host = arg
-        elif opt in ("--port"):
-            port = arg
-        elif opt in ("--reimport"):
-            reimport = True
-        elif opt in ("--repopath"):
-            custom_path = True
-            repo_root = path.normpath(arg)
-
-    if(dbname == None):
-        help(2)
-
-    db_connect(dbname, user, password, host, port)
-
-    if(custom_path == False):
-        repo_root = path.join(repo_root, dbname)
-
-    if(path.exists(repo_root) == False):
-        print "Creating output dir '%s'" % repo_root
-        try:
-            os.makedirs(repo_root)
-        except:
-            print "Could not create output dir '%s'" % repo_root
-            sys.exit(2)
-
-    with cd(repo_root):
-        last_mark = init_repo_root()
-        if(reimport == True): last_mark = 0
-        out = get_export_pipe(export_opts['export-type'])
-        last_mark = git_export(out, last_mark, export_opts)
-
-    # Allow the git sub process to clean up and exit
-    if(process is not None):
-        process.wait()
+        git_export(sys.stdout, args)
+        save_config()
+    except StandardError as e:
+        print "ERROR: %s" % e
+        print traceback.format_exc()
+        sys.exit(2)
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    main()
 
