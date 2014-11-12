@@ -30,7 +30,7 @@ git checkout master
 |Option                     |Description 
 |---------------------------|----
 | DBNAME                    |Name of the AssetServer database to export
-|-h, --help                 |show this help message and exit
+|-h, --help                 |show extended help message and exit
 |--username USERNAME        |(Required) Database user with read access to specified database.
 |--password PASSWORD        |Password for specified database user.
 |--host HOST                |AssetServer database host (default: localhost)
