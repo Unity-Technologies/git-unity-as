@@ -43,6 +43,9 @@ git checkout master
 By default, git-unity-as.py will save the last changelist exported from the given database, 
 so back-to-back imports will be incremental by default. Use --init to re-export the entire database.
 
+Contributors
+============
+Email stephenp@unity3d.com with feedback/suggestions.
 
 
 
