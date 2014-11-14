@@ -9,7 +9,7 @@ Developed with Python 2.7; relies on the psycopg2 Python module.
 MacOS
 -----
 1. Install [postgresql](http://www.postgresql.org/download/macosx/). I recommend the hombrew approach ("brew install postgresql")
-2. Install psycopg2 python module. "pip install psycopg2" (if you don't have pip, "sudo easy_install pip" first)
+2. Install psycopg2 python module. "sudo pip install psycopg2" (if you don't have pip, "sudo easy_install pip" first)
 
 Windows
 -------
