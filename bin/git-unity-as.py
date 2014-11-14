@@ -124,7 +124,7 @@ def get_config():
 def save_config():
     """persist the in-memory config to disk"""
     if CONF['config'] != None:
-        with open(CONF['file'], 'wb') as configfile:
+        with open(CONF['path'], 'wb') as configfile:
             CONF['config'].write(configfile)
 
 def export_data(out, data):
@@ -351,7 +351,6 @@ def git_export(out, args):
             out.write("from refs/heads/%s^0\n" % args.branch)
         else:
             out.write("from :%d\n" % last_mark)
-        
 
         # emit file operations and version data for the current changeset
         cursor.execute(QUERY_ASSETVERSIONDETAILS % mark)
@@ -439,4 +438,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
