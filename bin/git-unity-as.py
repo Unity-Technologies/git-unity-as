@@ -52,8 +52,9 @@ SELECT cs.serial as id, cs.description, cs.commit_time as date,
     ELSE
         COALESCE(p.realname, p.username) || ' <' || p.email || '>'
     END AS author
-FROM (""" + QUERY_USERS + """) AS p, changeset cs
-WHERE p.serial = cs.creator AND cs.serial > %d"""
+FROM changeset cs
+LEFT JOIN (""" + QUERY_USERS + """) AS p ON (p.serial = cs.creator)
+WHERE cs.serial > %d"""
 
 # list of all large object streams associated with a given asset version
 QUERY_STREAMS = """
