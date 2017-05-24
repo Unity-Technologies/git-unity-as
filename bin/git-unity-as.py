@@ -333,7 +333,7 @@ def git_export(out, args):
     first_changeset = True
     for changeset in changesets:
         mark = changeset['id']
-        date = changeset['date'].strftime('%s')
+        date = (changeset['date'] - datetime.datetime(1970,1,1)).total_seconds()
 
         author = changeset['author']
         comment = changeset['description']
